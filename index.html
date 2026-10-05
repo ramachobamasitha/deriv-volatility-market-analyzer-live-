@@ -96,8 +96,10 @@ button:disabled{opacity:.45;cursor:not-allowed}
 
 <script>
 // Deriv current public market-data connection layer.
-// V29 keeps the practical signal engine and adds a protected, persistent, non-blocking forward-performance tracker with backup/restore safeguards. Trailing zeroes are preserved using market pip_size.
-// This analyzer is read-only and uses the current public Options WebSocket. V29 performance tracking is non-blocking and never turns a valid signal into WAIT.
+// V31 keeps the practical signal engine and protected, persistent, non-blocking forward-performance tracker, and adds resilient WebSocket reconnect handling.
+// Trailing zeroes are preserved using market pip_size. The analyzer is read-only and uses the current public Options WebSocket.
+// V31 performance tracking is non-blocking and never turns a valid signal into WAIT.
+// Unexpected WebSocket disconnects are retried with exponential backoff; intentional user disconnects are not retried.
 // No Deriv account login, password, token, or OTP is required for market data.
 const PUBLIC_WS_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';
 
@@ -112,6 +114,11 @@ let connectionTimer = null;
 let reqId = 0;
 let receivedFirstMessage = false;
 let currentConnectionAttempt = 0;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let shouldReconnect = false;
+let lastPingAt = 0;
+let lastPongAt = 0;
 
 const $ = id => document.getElementById(id);
 
@@ -173,7 +180,7 @@ function startKeepAlive(){
       try { ws.send(JSON.stringify({ ping: 1, req_id: nextReqId() })); }
       catch {}
     }
-  }, 20000);
+  }, 30000);
 }
 
 function stopKeepAlive(){
@@ -219,24 +226,56 @@ function requestActiveSymbols(){
   }
 }
 
-function openPublicSocket(){
+function scheduleReconnect(reason){
+  if(!shouldReconnect || reconnectTimer) return;
+  const attemptNo = reconnectAttempts + 1;
+  const base = Math.min(30000, 1000 * (2 ** Math.min(attemptNo - 1, 5)));
+  const jitter = Math.floor(Math.random() * 500);
+  const delay = base + jitter;
+  reconnectAttempts = attemptNo;
+  setConnection('Reconnecting…');
+  setMarketStatus(`Connection lost. Reconnecting in ${(delay/1000).toFixed(1)}s…`);
+  setDataStatus('Waiting for the live tick connection to recover.');
+  setDiag(`${reason} Automatic reconnect attempt ${attemptNo} is scheduled with backoff.`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    openPublicSocket({reconnect:true});
+  }, delay);
+}
+
+function cancelReconnect(){
+  if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer=null; }
+}
+
+function openPublicSocket({reconnect=false}={}){
   if(ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
+  if(!reconnect) cancelReconnect();
+  shouldReconnect = true;
   currentConnectionAttempt += 1;
   const attempt = currentConnectionAttempt;
+  const keepFinalResult = reconnect;
   receivedFirstMessage = false;
-  availableMarkets = [];
-  selectedSymbol = null;
-  subscribedSymbol = null;
-  tickBuffer = [];
-  $('market').innerHTML = '<option>Waiting for live Volatility markets…</option>';
+  lastPingAt = 0;
+  lastPongAt = 0;
+
+  if(!reconnect){
+    availableMarkets = [];
+    selectedSymbol = null;
+    subscribedSymbol = null;
+    tickBuffer = [];
+    $('market').innerHTML = '<option>Waiting for live Volatility markets…</option>';
+  }else{
+    // Preserve the user's selected market and the frozen FINAL RESULT while recovering.
+    subscribedSymbol = null;
+  }
   $('market').disabled = true;
   $('analyzeBtn').disabled = true;
 
-  setConnection('Connecting to current public API…');
-  setMarketStatus('Opening Deriv current public WebSocket…');
-  setDataStatus('Waiting for Deriv market-data connection…');
-  setDiag(`Endpoint: ${PUBLIC_WS_URL}`);
+  setConnection(reconnect ? 'Reconnecting…' : 'Connecting to current public API…');
+  setMarketStatus(reconnect ? 'Reopening Deriv current public WebSocket…' : 'Opening Deriv current public WebSocket…');
+  setDataStatus(reconnect ? 'Restoring the selected live market stream…' : 'Waiting for Deriv market-data connection…');
+  setDiag(`Endpoint: ${PUBLIC_WS_URL}${reconnect ? ' • automatic recovery enabled' : ''}`);
   clearConnectionTimers();
 
   try{
@@ -245,6 +284,7 @@ function openPublicSocket(){
     setConnection('Connection failed');
     setMarketStatus('Browser could not create the Deriv WebSocket.');
     setDiag(`WebSocket constructor error: ${err?.message || err}`);
+    if(shouldReconnect) scheduleReconnect('Browser failed to create the WebSocket.');
     return;
   }
 
@@ -252,7 +292,7 @@ function openPublicSocket(){
     if(attempt !== currentConnectionAttempt) return;
     if(ws && ws.readyState === WebSocket.CONNECTING){
       setMarketStatus('Deriv WebSocket did not complete the connection handshake within 12 seconds.');
-      setDiag('Connection timeout. This points to a browser/network/gateway handshake problem, not an analyzer request.');
+      setDiag('Connection timeout. Automatic recovery will retry the public WebSocket with backoff.');
       try { ws.close(); } catch {}
     }
   }, 12000);
@@ -261,11 +301,15 @@ function openPublicSocket(){
     if(attempt !== currentConnectionAttempt) return;
     clearConnectionTimers();
     connected = true;
+    reconnectAttempts = 0;
+    cancelReconnect();
     setConnection('LIVE', true);
     $('connectBtn').textContent = '🔌 Disconnect';
     setMarketStatus('Connected to Deriv current public API. Loading live Volatility markets…');
     setDataStatus('Connected. Waiting for active market list…');
-    setDiag('WebSocket handshake succeeded. No authentication/OTP was used.');
+    setDiag(reconnect
+      ? 'WebSocket recovery succeeded. Public market-data stream is live again.'
+      : 'WebSocket handshake succeeded. No authentication/OTP was used.');
     startKeepAlive();
     requestActiveSymbols();
   };
@@ -287,14 +331,14 @@ function openPublicSocket(){
     }
 
     if(msg.msg_type === 'active_symbols'){
-      loadLiveMarkets(Array.isArray(msg.active_symbols) ? msg.active_symbols : []);
+      loadLiveMarkets(Array.isArray(msg.active_symbols) ? msg.active_symbols : [], {keepFinalResult});
       return;
     }
 
     if(msg.msg_type === 'history' && msg.history){
       const prices = Array.isArray(msg.history.prices) ? msg.history.prices.map(Number) : [];
       const times = Array.isArray(msg.history.times) ? msg.history.times : [];
-        const marketMeta = availableMarkets.find(m => m.symbol === selectedSymbol);
+      const marketMeta = availableMarkets.find(m => m.symbol === selectedSymbol);
       const historyPipSize = Number.isFinite(Number(msg.pip_size)) ? Number(msg.pip_size) : marketMeta?.pipSize;
       const historical = prices.map((quote, i) => ({
         quote,
@@ -317,9 +361,10 @@ function openPublicSocket(){
       const tickPipSize = Number.isFinite(Number(msg.tick.pip_size)) ? Number(msg.tick.pip_size) : marketMeta?.pipSize;
       const digit = digitOfQuote(quote, tickPipSize);
       if(symbol === selectedSymbol && Number.isFinite(quote) && Number.isInteger(digit)){
-        tickBuffer.push({ quote, digit, epoch: msg.tick.epoch ?? null });
+        const liveTick = { quote, digit, epoch: msg.tick.epoch ?? null };
+        tickBuffer.push(liveTick);
         const prevTick = tickBuffer.length>1 ? tickBuffer[tickBuffer.length-2] : null;
-        resolvePendingWithTick(tickBuffer[tickBuffer.length-1], prevTick);
+        resolvePendingWithTick(liveTick, prevTick);
         if(tickBuffer.length > 5000) tickBuffer.shift();
         updateDataStatus();
       }
@@ -327,11 +372,11 @@ function openPublicSocket(){
     }
 
     if(msg.msg_type === 'ping'){
+      lastPongAt = Date.now();
       setDiag('Connection verified: Deriv public API ping acknowledged.');
       return;
     }
 
-    // Some API responses can be useful even if the page does not have a dedicated UI for them.
     if(msg.req_id){
       setDiag(`Deriv response received (msg_type: ${msg.msg_type || 'unknown'}, req_id: ${msg.req_id}).`);
     }
@@ -343,8 +388,8 @@ function openPublicSocket(){
     clearConnectionTimers();
     setConnection('Connection error');
     setMarketStatus('Deriv current public WebSocket reported a connection error.');
-    setDataStatus('No live tick data yet.');
-    setDiag('WebSocket error event received. The browser did not provide a more specific error.');
+    setDataStatus('Waiting for automatic recovery…');
+    setDiag('WebSocket error event received. The browser did not provide a more specific error; recovery will be handled by the close event.');
   };
 
   ws.onclose = event => {
@@ -352,31 +397,37 @@ function openPublicSocket(){
     clearConnectionTimers();
     connected = false;
     stopKeepAlive();
+    ws = null;
     $('connectBtn').textContent = '🔌 Connect to Deriv';
     $('analyzeBtn').disabled = true;
 
     const code = event?.code ?? 0;
     const reason = event?.reason ? ` — ${event.reason}` : '';
-    setConnection('Disconnected');
-    setMarketStatus(`Deriv current public connection closed (code ${code})${reason}`);
 
-    if(code === 1006){
-      setDiag(receivedFirstMessage
-        ? 'Abnormal closure (1006) after receiving data from the current public API.'
-        : 'Abnormal closure (1006) before the current public API delivered a message.');
-    }else{
-      setDiag(`Current public API WebSocket closed. Code ${code}${reason}.`);
+    if(code === 1000 || !shouldReconnect){
+      setConnection('Disconnected');
+      setMarketStatus(`Deriv current public connection closed (code ${code})${reason}`);
+      setDiag(code === 1000 ? 'User-requested disconnect completed.' : `Current public API WebSocket closed. Code ${code}${reason}.`);
+      return;
     }
+
+    const diagnostic = code === 1006
+      ? (receivedFirstMessage ? 'Abnormal closure (1006) after receiving data from the current public API.' : 'Abnormal closure (1006) before the current public API delivered a message.')
+      : `Current public API WebSocket closed unexpectedly. Code ${code}${reason}.`;
+    scheduleReconnect(diagnostic);
   };
 }
 
 function closePublicSocket(){
+  shouldReconnect = false;
+  cancelReconnect();
   currentConnectionAttempt += 1;
   clearConnectionTimers();
   stopKeepAlive();
   connected = false;
-  if(ws){ try { ws.close(1000, 'User disconnected'); } catch {} }
+  const socket=ws;
   ws = null;
+  if(socket){ try { socket.close(1000, 'User disconnected'); } catch {} }
   subscribedSymbol = null;
   $('connectBtn').textContent = '🔌 Connect to Deriv';
   $('analyzeBtn').disabled = true;
@@ -385,7 +436,7 @@ function closePublicSocket(){
   setDataStatus('No live tick data yet.');
 }
 
-function loadLiveMarkets(symbols){
+function loadLiveMarkets(symbols,{keepFinalResult=false}={}){
   availableMarkets = symbols
     .map(normalizeMarket)
     .filter(Boolean)
@@ -410,11 +461,13 @@ function loadLiveMarkets(symbols){
     select.appendChild(opt);
   }
 
+  const preferred = selectedSymbol && availableMarkets.some(m=>m.symbol===selectedSymbol) ? selectedSymbol : availableMarkets[0].symbol;
+  select.value = preferred;
+  selectedSymbol = preferred;
   select.disabled = false;
-  selectedSymbol = select.value;
   setMarketStatus(`Live availability loaded: ${availableMarkets.length.toLocaleString()} Volatility market(s). Choose one to start its live tick stream.`);
   setDiag(`Active-symbol request succeeded. ${availableMarkets.length} Volatility market(s) found.`);
-  subscribeToSelected();
+  subscribeToSelected({resetFinal:!keepFinalResult});
 }
 
 function unsubscribe(){
@@ -425,7 +478,7 @@ function unsubscribe(){
   }
 }
 
-function subscribeToSelected(){
+function subscribeToSelected({resetFinal=true}={}){
   if(!connected || !selectedSymbol) return;
   unsubscribe();
   tickBuffer = [];
@@ -455,7 +508,7 @@ function subscribeToSelected(){
 
   const market = availableMarkets.find(m => m.symbol === selectedSymbol);
   setMarketStatus(`🟢 LIVE: ${market ? market.name : selectedSymbol}. Receiving historical + live ticks…`);
-  showFinal('WAIT', 'Collecting live ticks for the selected market.');
+  if(resetFinal) showFinal('WAIT', 'Collecting live ticks for the selected market.');
   setDataStatus('Loading recent tick history and subscribing to new ticks…');
   setDiag(`Requested tick history (req_id ${historyReq}) and live ticks (req_id ${tickReq}) for ${selectedSymbol}. History is a one-time request; live ticks use subscribe: 1.`);
 }
@@ -474,7 +527,11 @@ $('market').addEventListener('change', () => {
 $('tickSample').addEventListener('change', updateDataStatus);
 $('connectBtn').addEventListener('click', () => {
   if(connected) closePublicSocket();
-  else openPublicSocket();
+  else {
+    shouldReconnect = true;
+    reconnectAttempts = 0;
+    openPublicSocket({reconnect:false});
+  }
 });
 
 function sampleData(){
@@ -576,6 +633,7 @@ function practicalCandidate(candidates,minEdge=0.5,strategy=''){
 
 
 // Tracker learns from completed forward outcomes. First recalibration: 300 completed signals per strategy; subsequent recalibrations every 100. Learning only ranks candidates; it never blocks a signal.
+// Existing tracker/localStorage keys are intentionally unchanged so deployments do not erase the user's prior results.
 const TRACKER_KEY='deriv_analyzer_signal_tracker_v27';
 const PENDING_KEY='deriv_analyzer_pending_signals_v29';
 let tracker=loadTracker();
@@ -617,6 +675,7 @@ function outcomeForSignal(rec,tick,prev){
     case 'rise-fall':
     case 'high-low-ticks':
     case 'asian':
+      if(rec.signalEpoch!==null && tick?.epoch!==null && Number.isFinite(Number(rec.signalEpoch)) && Number.isFinite(Number(tick.epoch)) && Number(tick.epoch)<=Number(rec.signalEpoch)) return null;
       if(!prev || typeof prev.quote!=='number' || typeof tick?.quote!=='number') return null;
       const up=tick.quote>prev.quote, down=tick.quote<prev.quote;
       if(rec.side==='RISE'||rec.side==='HIGH TICKS'||rec.side==='ASIAN UP') return up;
@@ -685,7 +744,7 @@ function registerSignal(trace,data,result){
     timestamp:new Date().toISOString(), market:selectedSymbol, strategy:trace.strategy,
     label:result, side:parts[0], targetDigit:null, barrier:null,
     signalEpoch, signalQuote:last?.quote ?? null,
-    ticksUsed:data.length, engine:'v29-tracker'
+    ticksUsed:data.length, engine:'v31-tracker'
   };
   if(trace.strategy==='matches-pattern') rec.targetDigit=Number(parts[1]);
   if(trace.strategy==='matches-differs') rec.targetDigit=Number(parts[1]);
@@ -739,7 +798,7 @@ function downloadBlob(filename, content){
 function exportTrackerBackup(tag='manual'){
   const payload={
     format:'deriv-volatility-analyzer-tracker-backup',
-    version:29,
+    version:31,
     exportedAt:new Date().toISOString(),
     tracker,
     pendingSignals
@@ -803,7 +862,7 @@ function runAnalysis(){
   const trace={
     timestamp:new Date().toISOString(), market:market?.name||selectedSymbol||'', strategy,
     ticks:data.length, precision:precisionText, digits:quality.present.join(','),
-    result:'WAIT', engine:'v29-tracker-learning'
+    result:'WAIT', engine:'v31-tracker-learning'
   };
   let result='WAIT';
 
