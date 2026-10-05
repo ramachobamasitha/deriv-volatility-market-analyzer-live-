@@ -55,7 +55,6 @@ button:disabled{opacity:.45;cursor:not-allowed}
         <option value="high-low-ticks">High / Low Ticks</option>
         <option value="rise-fall">Rise / Fall</option>
       </select>
-      <div class="status">Matches Pattern Prediction is Matches-only. Up/Down and Specific Results are removed. Over/Under checks only Over 1–4 and Under 6–9 using normalized statistical barrier scoring.</div>
     </div>
 
     <div class="card">
@@ -69,7 +68,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
       </select>
       <button id="connectBtn">🔌 Connect to Deriv</button>
       <button id="analyzeBtn" disabled>⚡ Analyze Market</button>
-      <div id="dataStatus" class="status">No live tick data yet.</div><div id="diag" class="status small"></div>
+      <div id="dataStatus" class="status" style="display:none"></div><div id="diag" class="status small"></div>
     </div>
   </div>
 
