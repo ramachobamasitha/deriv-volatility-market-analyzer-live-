@@ -1,0 +1,931 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Deriv Volatility Market Analyzer</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#07111f;color:#eef6ff;font-family:Arial,sans-serif}
+.wrap{max-width:1080px;margin:auto;padding:20px}
+.hero,.card,.final{border-radius:20px;padding:22px}
+.hero{background:linear-gradient(135deg,#163b66,#087c78)}
+.hero h1{margin:0 0 8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin-top:16px}
+.card,.final{margin-top:14px;background:#101d30;border:1px solid #29415f}
+label{display:block;font-weight:bold;margin-bottom:8px}
+select,button{width:100%;padding:13px;border-radius:11px;font-size:15px}
+select{background:#091525;color:white;border:1px solid #405774}
+button{margin-top:14px;border:0;background:linear-gradient(90deg,#08d69a,#1aa8ff);font-weight:900;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}
+.status{margin-top:10px;color:#a9c0d5;font-size:13px;line-height:1.5}
+.badge{display:inline-block;padding:6px 10px;border-radius:999px;background:#172b42;margin-top:8px;font-size:12px}
+.final{text-align:center;border:2px solid #315a7d}
+.result{font-size:32px;font-weight:900;margin:15px;background:linear-gradient(90deg,#38f2af,#65d9ff);color:transparent;background-clip:text}
+.meta{line-height:1.7;color:#c9d8e8}
+.note{display:none}
+.small{font-size:12px;color:#93a9bd}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>⚡ Deriv Volatility Market Analyzer</h1>
+    <div>Live Volatility markets • common practical statistical ranking + forward performance tracking • one final result</div>
+    <div id="connectionBadge" class="badge">🔴 Disconnected</div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <label for="market">Volatility Market</label>
+      <select id="market" disabled>
+        <option>Loading live Volatility markets…</option>
+      </select>
+      <div id="marketStatus" class="status">Connecting to Deriv to load currently available Volatility markets.</div>
+    </div>
+
+    <div class="card">
+      <label for="strategy">Strategy</label>
+      <select id="strategy">
+        <option value="matches-pattern">Matches Pattern Prediction</option>
+        <option value="matches-differs">Matches / Differs</option>
+        <option value="asian">Asian Up / Asian Down</option>
+        <option value="over-under">Over / Under</option>
+        <option value="even-odd">Even / Odd</option>
+        <option value="high-low-ticks">High / Low Ticks</option>
+        <option value="rise-fall">Rise / Fall</option>
+      </select>
+      <div class="status">Matches Pattern Prediction is Matches-only. Up/Down and Specific Results are removed. Over/Under checks only Over 1–4 and Under 6–9 using normalized statistical barrier scoring.</div>
+    </div>
+
+    <div class="card">
+      <label for="tickSample">Tick Sample</label>
+      <select id="tickSample">
+        <option value="100">100</option>
+        <option value="250">250</option>
+        <option value="500" selected>500</option>
+        <option value="1000">1,000</option>
+        <option value="2000">2,000</option>
+      </select>
+      <button id="connectBtn">🔌 Connect to Deriv</button>
+      <button id="analyzeBtn" disabled>⚡ Analyze Market</button>
+      <div id="dataStatus" class="status">No live tick data yet.</div><div id="diag" class="status small"></div>
+    </div>
+  </div>
+
+  <div class="final">
+    <h2>FINAL RESULT</h2>
+    <div id="result" class="result">WAIT</div>
+    <div id="details" class="meta" aria-hidden="true"></div>
+    <div class="note">This is a statistical analysis tool, not a guarantee of the next contract outcome.</div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h3 style="margin-top:0">📊 Signal Performance Tracker</h3>
+    <div id="trackerStatus" class="status">No completed signals yet.</div>
+    <div id="trackerSummary" class="status small">Performance details will appear after signals resolve.</div>
+    <div id="trackerLearning" class="status small">Learning starts after 300 completed signals per strategy; later recalibration occurs every 100. Learning only ranks candidates and never blocks signals.</div>
+    <div class="grid" style="margin-top:10px">
+      <button id="exportTrackerBtn" type="button" style="background:linear-gradient(90deg,#6f7bf7,#9b59ff)">💾 Export Backup</button>
+      <button id="restoreTrackerBtn" type="button" style="background:#28506b">📥 Restore Backup</button>
+      <button id="resetTrackerBtn" type="button" style="background:#5a2930">🔒 Reset Tracker Data</button>
+    </div>
+    <input id="restoreTrackerFile" type="file" accept="application/json,.json" style="display:none">
+  </div>
+</div>
+
+<script>
+// Deriv current public market-data connection layer.
+// V29 keeps the practical signal engine and adds a protected, persistent, non-blocking forward-performance tracker with backup/restore safeguards. Trailing zeroes are preserved using market pip_size.
+// This analyzer is read-only and uses the current public Options WebSocket. V29 performance tracking is non-blocking and never turns a valid signal into WAIT.
+// No Deriv account login, password, token, or OTP is required for market data.
+const PUBLIC_WS_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';
+
+let ws = null;
+let connected = false;
+let availableMarkets = [];
+let selectedSymbol = null;
+let tickBuffer = [];
+let subscribedSymbol = null;
+let keepAliveTimer = null;
+let connectionTimer = null;
+let reqId = 0;
+let receivedFirstMessage = false;
+let currentConnectionAttempt = 0;
+
+const $ = id => document.getElementById(id);
+
+function nextReqId(){ return ++reqId; }
+function setConnection(text, live=false){
+  $('connectionBadge').textContent = live ? '🟢 LIVE' : '🔴 ' + text;
+}
+function setMarketStatus(text){ $('marketStatus').textContent = text; }
+function setDataStatus(text){ $('dataStatus').textContent = text; }
+function setDiag(text){ $('diag').textContent = text; }
+
+function decimalPlacesFromPipSize(pipSize){
+  const p = Number(pipSize);
+  if(!Number.isFinite(p) || p <= 0) return null;
+  // Current API market metadata commonly exposes pip_size as the price step (e.g. 0.01).
+  // Legacy responses may expose an integer digit count (e.g. 2 or 5), so support both.
+  if(Number.isInteger(p) && p >= 1 && p <= 10) return p;
+  const text = p.toString().toLowerCase();
+  if(text.includes('e-')){
+    const exp = Number(text.split('e-')[1]);
+    return Number.isFinite(exp) ? exp : null;
+  }
+  const dot = text.indexOf('.');
+  return dot >= 0 ? text.length - dot - 1 : 0;
+}
+
+function digitOfQuote(q, pipSize){
+  const n = Number(q);
+  if(!Number.isFinite(n)) return null;
+
+  const decimals = decimalPlacesFromPipSize(pipSize);
+  if(decimals !== null){
+    // Preserve trailing zeroes. Example: 1000.10 with 2-decimal precision
+    // has last digit 0, not 1.
+    const fixed = Math.abs(n).toFixed(Math.min(decimals, 12));
+    const fractional = fixed.includes('.') ? fixed.split('.')[1] : '';
+    return Number((fractional.slice(-1) || '0'));
+  }
+
+  // Fallback only when no precision metadata is available.
+  const fixed = Math.abs(n).toFixed(12);
+  const fractional = fixed.includes('.') ? fixed.split('.')[1].replace(/0+$/,'') : '';
+  return Number(fractional ? fractional.slice(-1) : '0');
+}
+
+function showFinal(result, detail){
+  $('result').textContent = result;
+  $('details').innerHTML = detail;
+}
+
+function clearConnectionTimers(){
+  if(connectionTimer){ clearTimeout(connectionTimer); connectionTimer=null; }
+}
+
+function startKeepAlive(){
+  stopKeepAlive();
+  keepAliveTimer = setInterval(() => {
+    if(ws && ws.readyState === WebSocket.OPEN){
+      try { ws.send(JSON.stringify({ ping: 1, req_id: nextReqId() })); }
+      catch {}
+    }
+  }, 20000);
+}
+
+function stopKeepAlive(){
+  if(keepAliveTimer){ clearInterval(keepAliveTimer); keepAliveTimer=null; }
+}
+
+function handleApiError(msg){
+  const e = msg?.error || {};
+  const code = e.code ? ` (${e.code})` : '';
+  const message = e.message || 'Unknown Deriv API error.';
+  setMarketStatus(`Deriv API error${code}: ${message}`);
+  setDataStatus('Deriv returned an API error. No market data was loaded.');
+  setDiag(`Request ${msg?.req_id ?? 'unknown'} was rejected by the current public API.`);
+}
+
+function normalizeMarket(raw){
+  const symbol = raw?.underlying_symbol ?? raw?.symbol ?? '';
+  const name = raw?.underlying_symbol_name ?? raw?.display_name ?? raw?.name ?? symbol;
+  const market = String(raw?.market ?? '').toLowerCase();
+  const submarket = String(raw?.submarket ?? '').toLowerCase();
+  const haystack = `${name} ${market} ${submarket} ${symbol}`.toLowerCase();
+
+  // Volatility synthetic indices are selected from Deriv's live active-symbol response.
+  // Do not hardcode a market list.
+  const isSynthetic = market === 'synthetic_index' || submarket === 'volatility' || /volatility\s*\d+/i.test(haystack);
+  const isVolatility = /volatility\s*\d+/i.test(`${name} ${symbol}`) || /\b1hz\d+v\b/i.test(symbol);
+
+  if(!symbol || !isSynthetic || !isVolatility) return null;
+  return { symbol: String(symbol), name: String(name), pipSize: Number.isFinite(Number(raw?.pip_size)) ? Number(raw.pip_size) : null };
+}
+
+function requestActiveSymbols(){
+  if(!ws || ws.readyState !== WebSocket.OPEN) return;
+  const id = nextReqId();
+  setMarketStatus('Connected. Requesting currently active symbols from Deriv…');
+  try{
+    // Current public API: no legacy product_type parameter.
+    ws.send(JSON.stringify({ active_symbols: 'brief', req_id: id }));
+    setDiag(`Sent active_symbols request (req_id ${id}) through ${PUBLIC_WS_URL}`);
+  }catch(err){
+    setMarketStatus('Could not send active-symbol request.');
+    setDiag(`Send error: ${err?.message || err}`);
+  }
+}
+
+function openPublicSocket(){
+  if(ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
+  currentConnectionAttempt += 1;
+  const attempt = currentConnectionAttempt;
+  receivedFirstMessage = false;
+  availableMarkets = [];
+  selectedSymbol = null;
+  subscribedSymbol = null;
+  tickBuffer = [];
+  $('market').innerHTML = '<option>Waiting for live Volatility markets…</option>';
+  $('market').disabled = true;
+  $('analyzeBtn').disabled = true;
+
+  setConnection('Connecting to current public API…');
+  setMarketStatus('Opening Deriv current public WebSocket…');
+  setDataStatus('Waiting for Deriv market-data connection…');
+  setDiag(`Endpoint: ${PUBLIC_WS_URL}`);
+  clearConnectionTimers();
+
+  try{
+    ws = new WebSocket(PUBLIC_WS_URL);
+  }catch(err){
+    setConnection('Connection failed');
+    setMarketStatus('Browser could not create the Deriv WebSocket.');
+    setDiag(`WebSocket constructor error: ${err?.message || err}`);
+    return;
+  }
+
+  connectionTimer = setTimeout(() => {
+    if(attempt !== currentConnectionAttempt) return;
+    if(ws && ws.readyState === WebSocket.CONNECTING){
+      setMarketStatus('Deriv WebSocket did not complete the connection handshake within 12 seconds.');
+      setDiag('Connection timeout. This points to a browser/network/gateway handshake problem, not an analyzer request.');
+      try { ws.close(); } catch {}
+    }
+  }, 12000);
+
+  ws.onopen = () => {
+    if(attempt !== currentConnectionAttempt) return;
+    clearConnectionTimers();
+    connected = true;
+    setConnection('LIVE', true);
+    $('connectBtn').textContent = '🔌 Disconnect';
+    setMarketStatus('Connected to Deriv current public API. Loading live Volatility markets…');
+    setDataStatus('Connected. Waiting for active market list…');
+    setDiag('WebSocket handshake succeeded. No authentication/OTP was used.');
+    startKeepAlive();
+    requestActiveSymbols();
+  };
+
+  ws.onmessage = ev => {
+    if(attempt !== currentConnectionAttempt) return;
+    receivedFirstMessage = true;
+
+    let msg;
+    try { msg = JSON.parse(ev.data); }
+    catch {
+      setDiag('Received a non-JSON WebSocket message from Deriv.');
+      return;
+    }
+
+    if(msg.error){
+      handleApiError(msg);
+      return;
+    }
+
+    if(msg.msg_type === 'active_symbols'){
+      loadLiveMarkets(Array.isArray(msg.active_symbols) ? msg.active_symbols : []);
+      return;
+    }
+
+    if(msg.msg_type === 'history' && msg.history){
+      const prices = Array.isArray(msg.history.prices) ? msg.history.prices.map(Number) : [];
+      const times = Array.isArray(msg.history.times) ? msg.history.times : [];
+        const marketMeta = availableMarkets.find(m => m.symbol === selectedSymbol);
+      const historyPipSize = Number.isFinite(Number(msg.pip_size)) ? Number(msg.pip_size) : marketMeta?.pipSize;
+      const historical = prices.map((quote, i) => ({
+        quote,
+        digit: digitOfQuote(quote, historyPipSize),
+        epoch: times[i] ?? null
+      })).filter(x => Number.isFinite(x.quote) && Number.isInteger(x.digit));
+
+      // Keep history as the base sample. Any ticks received afterward are appended.
+      tickBuffer = historical.slice(-5000);
+      updateDataStatus();
+      const historyDecimals = decimalPlacesFromPipSize(historyPipSize);
+      setDiag(`Received ${historical.length.toLocaleString()} historical ticks for ${selectedSymbol}. Digit extraction uses ${historyDecimals === null ? 'fallback precision' : historyDecimals + ' decimal place(s)'} from pip_size.`);
+      return;
+    }
+
+    if(msg.msg_type === 'tick' && msg.tick){
+      const symbol = msg.tick.symbol ?? selectedSymbol;
+      const quote = Number(msg.tick.quote);
+      const marketMeta = availableMarkets.find(m => m.symbol === selectedSymbol);
+      const tickPipSize = Number.isFinite(Number(msg.tick.pip_size)) ? Number(msg.tick.pip_size) : marketMeta?.pipSize;
+      const digit = digitOfQuote(quote, tickPipSize);
+      if(symbol === selectedSymbol && Number.isFinite(quote) && Number.isInteger(digit)){
+        tickBuffer.push({ quote, digit, epoch: msg.tick.epoch ?? null });
+        const prevTick = tickBuffer.length>1 ? tickBuffer[tickBuffer.length-2] : null;
+        resolvePendingWithTick(tickBuffer[tickBuffer.length-1], prevTick);
+        if(tickBuffer.length > 5000) tickBuffer.shift();
+        updateDataStatus();
+      }
+      return;
+    }
+
+    if(msg.msg_type === 'ping'){
+      setDiag('Connection verified: Deriv public API ping acknowledged.');
+      return;
+    }
+
+    // Some API responses can be useful even if the page does not have a dedicated UI for them.
+    if(msg.req_id){
+      setDiag(`Deriv response received (msg_type: ${msg.msg_type || 'unknown'}, req_id: ${msg.req_id}).`);
+    }
+  };
+
+  ws.onerror = () => {
+    if(attempt !== currentConnectionAttempt) return;
+    connected = false;
+    clearConnectionTimers();
+    setConnection('Connection error');
+    setMarketStatus('Deriv current public WebSocket reported a connection error.');
+    setDataStatus('No live tick data yet.');
+    setDiag('WebSocket error event received. The browser did not provide a more specific error.');
+  };
+
+  ws.onclose = event => {
+    if(attempt !== currentConnectionAttempt) return;
+    clearConnectionTimers();
+    connected = false;
+    stopKeepAlive();
+    $('connectBtn').textContent = '🔌 Connect to Deriv';
+    $('analyzeBtn').disabled = true;
+
+    const code = event?.code ?? 0;
+    const reason = event?.reason ? ` — ${event.reason}` : '';
+    setConnection('Disconnected');
+    setMarketStatus(`Deriv current public connection closed (code ${code})${reason}`);
+
+    if(code === 1006){
+      setDiag(receivedFirstMessage
+        ? 'Abnormal closure (1006) after receiving data from the current public API.'
+        : 'Abnormal closure (1006) before the current public API delivered a message.');
+    }else{
+      setDiag(`Current public API WebSocket closed. Code ${code}${reason}.`);
+    }
+  };
+}
+
+function closePublicSocket(){
+  currentConnectionAttempt += 1;
+  clearConnectionTimers();
+  stopKeepAlive();
+  connected = false;
+  if(ws){ try { ws.close(1000, 'User disconnected'); } catch {} }
+  ws = null;
+  subscribedSymbol = null;
+  $('connectBtn').textContent = '🔌 Connect to Deriv';
+  $('analyzeBtn').disabled = true;
+  setConnection('Disconnected');
+  setMarketStatus('Disconnected from Deriv.');
+  setDataStatus('No live tick data yet.');
+}
+
+function loadLiveMarkets(symbols){
+  availableMarkets = symbols
+    .map(normalizeMarket)
+    .filter(Boolean)
+    .filter((x,i,a)=>a.findIndex(y=>y.symbol===x.symbol)===i)
+    .sort((a,b)=>a.name.localeCompare(b.name, undefined, {numeric:true}));
+
+  const select = $('market');
+  select.innerHTML = '';
+
+  if(!availableMarkets.length){
+    select.innerHTML = '<option>No live Volatility markets returned</option>';
+    select.disabled = true;
+    setMarketStatus('Deriv connected, but the current active-symbol response contains no Volatility markets.');
+    setDiag('Active-symbol response received successfully, but no Volatility symbols matched the live-market filter.');
+    return;
+  }
+
+  for(const m of availableMarkets){
+    const opt = document.createElement('option');
+    opt.value = m.symbol;
+    opt.textContent = `${m.name} (${m.symbol})`;
+    select.appendChild(opt);
+  }
+
+  select.disabled = false;
+  selectedSymbol = select.value;
+  setMarketStatus(`Live availability loaded: ${availableMarkets.length.toLocaleString()} Volatility market(s). Choose one to start its live tick stream.`);
+  setDiag(`Active-symbol request succeeded. ${availableMarkets.length} Volatility market(s) found.`);
+  subscribeToSelected();
+}
+
+function unsubscribe(){
+  if(ws && ws.readyState === WebSocket.OPEN && subscribedSymbol){
+    // Current Deriv market-data API supports forget_all for active tick subscriptions.
+    try { ws.send(JSON.stringify({forget_all: 'ticks', req_id: nextReqId()})); } catch {}
+    subscribedSymbol = null;
+  }
+}
+
+function subscribeToSelected(){
+  if(!connected || !selectedSymbol) return;
+  unsubscribe();
+  tickBuffer = [];
+  subscribedSymbol = selectedSymbol;
+
+  const historyReq = nextReqId();
+  const tickReq = nextReqId();
+  try{
+    ws.send(JSON.stringify({
+      ticks_history: selectedSymbol,
+      count: 1000,
+      end: 'latest',
+      style: 'ticks',
+      req_id: historyReq
+    }));
+
+    ws.send(JSON.stringify({
+      ticks: selectedSymbol,
+      subscribe: 1,
+      req_id: tickReq
+    }));
+  }catch(err){
+    setMarketStatus('Could not request tick data from the current public API.');
+    setDiag(`Tick request send error: ${err?.message || err}`);
+    return;
+  }
+
+  const market = availableMarkets.find(m => m.symbol === selectedSymbol);
+  setMarketStatus(`🟢 LIVE: ${market ? market.name : selectedSymbol}. Receiving historical + live ticks…`);
+  showFinal('WAIT', 'Collecting live ticks for the selected market.');
+  setDataStatus('Loading recent tick history and subscribing to new ticks…');
+  setDiag(`Requested tick history (req_id ${historyReq}) and live ticks (req_id ${tickReq}) for ${selectedSymbol}. History is a one-time request; live ticks use subscribe: 1.`);
+}
+
+function updateDataStatus(){
+  const required = Number($('tickSample').value);
+  const have = tickBuffer.length;
+  setDataStatus(`Live market data available: ${have.toLocaleString()} / ${required.toLocaleString()} ticks required for analysis.`);
+  $('analyzeBtn').disabled = !connected || have < Math.min(required,30);
+}
+
+$('market').addEventListener('change', () => {
+  selectedSymbol = $('market').value;
+  if(connected) subscribeToSelected();
+});
+$('tickSample').addEventListener('change', updateDataStatus);
+$('connectBtn').addEventListener('click', () => {
+  if(connected) closePublicSocket();
+  else openPublicSocket();
+});
+
+function sampleData(){
+  const n=Number($('tickSample').value);
+  return tickBuffer.slice(-n);
+}
+function digitCounts(data){
+  const c=Array(10).fill(0);
+  data.forEach(x=>{ if(Number.isInteger(x.digit)) c[x.digit]++; });
+  return c;
+}
+function rankedDigits(data){
+  const c=digitCounts(data), n=data.length||1;
+  return c.map((count,d)=>({digit:d,count,pct:count/n*100}))
+    .sort((a,b)=>b.count-a.count);
+}
+function sideStats(data){
+  let even=0,odd=0,rise=0,fall=0,flat=0;
+  for(let i=0;i<data.length;i++){
+    if(data[i].digit%2===0) even++; else odd++;
+    if(i){
+      if(data[i].quote>data[i-1].quote) rise++;
+      else if(data[i].quote<data[i-1].quote) fall++;
+      else flat++;
+    }
+  }
+  return {
+    evenPct:even/data.length*100,
+    oddPct:odd/data.length*100,
+    risePct:(rise/(rise+fall||1))*100,
+    fallPct:(fall/(rise+fall||1))*100,
+    flat
+  };
+}
+function patternCandidates(data){
+  if(data.length < 50) return [];
+  const seq=data.map(x=>x.digit), candidates=[];
+
+  // Search recurring suffix patterns of length 1–4 across the whole sample.
+  // Each occurrence is used to measure which digit followed that pattern.
+  for(let len=1;len<=4;len++){
+    const groups=new Map();
+    for(let i=len;i<seq.length;i++){
+      const key=seq.slice(i-len,i).join('');
+      if(!groups.has(key)) groups.set(key,Array(10).fill(0));
+      groups.get(key)[seq[i]]++;
+    }
+
+    for(const [key, following] of groups.entries()){
+      const total=following.reduce((a,b)=>a+b,0);
+      if(total < 6) continue;
+      const ranked=following.map((n,d)=>({digit:d,n,pct:n/total*100}))
+        .sort((a,b)=>b.n-a.n);
+      const best=ranked[0];
+      const second=ranked[1] || {pct:0};
+      const baseline=0.10;
+      const se=Math.sqrt(baseline*(1-baseline)/total);
+      const score=se ? ((best.n/total)-baseline)/se : 0;
+      const edge=best.pct-10;
+      const lead=best.pct-second.pct;
+      candidates.push({len,key,total,best,second,score,edge,lead});
+    }
+  }
+
+  // Rank patterns the same practical way as the other strategies:
+  // normalized strength first, raw edge second, while requiring a small
+  // positive edge so a completely flat sample does not create a signal.
+  candidates.sort((a,b)=>b.score-a.score || b.edge-a.edge || b.total-a.total);
+  return candidates;
+}
+function digitQuality(data){
+  const counts=digitCounts(data);
+  const present=counts.map((n,d)=>n?d:null).filter(v=>v!==null);
+  const market=availableMarkets.find(m=>m.symbol===selectedSymbol);
+  const decimals=decimalPlacesFromPipSize(market?.pipSize);
+  return {counts,present,decimals,pipSize:market?.pipSize ?? null};
+}
+
+function normalZ(successes,n,baseline){
+  if(!n || baseline<=0 || baseline>=1) return 0;
+  const p=successes/n;
+  const se=Math.sqrt(baseline*(1-baseline)/n);
+  return se ? (p-baseline)/se : 0;
+}
+
+function scoreBinary(successes,total,baseline){
+  const p=total ? successes/total : 0;
+  const edge=(p-baseline)*100;
+  const z=normalZ(successes,total,baseline);
+  return {p,edge,z};
+}
+
+function practicalCandidate(candidates,minEdge=0.5,strategy=''){
+  const eligible=candidates.filter(c=>c && c.edge>=minEdge);
+  eligible.forEach(c=>{ c.learningBonus=strategy&&c.label?empiricalBonus(strategy,c.label):0; c.rankScore=c.score+c.learningBonus; });
+  eligible.sort((a,b)=>b.rankScore-a.rankScore || b.score-a.score || b.edge-a.edge || (b.total||0)-(a.total||0));
+  return eligible[0] || null;
+}
+
+
+// Tracker learns from completed forward outcomes. First recalibration: 300 completed signals per strategy; subsequent recalibrations every 100. Learning only ranks candidates; it never blocks a signal.
+const TRACKER_KEY='deriv_analyzer_signal_tracker_v27';
+const PENDING_KEY='deriv_analyzer_pending_signals_v29';
+let tracker=loadTracker();
+let pendingSignals=loadPending();
+
+function loadTracker(){
+  try{
+    const x=JSON.parse(localStorage.getItem(TRACKER_KEY)||'null');
+    if(x && Array.isArray(x.records)) return x;
+  }catch(e){}
+  return {records:[], recalibrations:{}};
+}
+function saveTracker(){
+  try{localStorage.setItem(TRACKER_KEY,JSON.stringify(tracker));}catch(e){console.warn('Tracker storage unavailable',e);}
+}
+function loadPending(){
+  try{
+    const x=JSON.parse(localStorage.getItem(PENDING_KEY)||'null');
+    return x && typeof x==='object' ? x : {};
+  }catch(e){ return {}; }
+}
+function savePending(){
+  try{localStorage.setItem(PENDING_KEY,JSON.stringify(pendingSignals));}catch(e){console.warn('Pending-signal storage unavailable',e);}
+}
+function signalKey(rec){
+  return `${rec.strategy}|${rec.market}|${rec.label}`;
+}
+function outcomeForSignal(rec,tick,prev){
+  const d=tick?.digit;
+  switch(rec.strategy){
+    case 'matches-pattern':
+      return Number.isInteger(d) ? d===rec.targetDigit : null;
+    case 'matches-differs':
+      return Number.isInteger(d) ? (rec.side==='MATCHES' ? d===rec.targetDigit : d!==rec.targetDigit) : null;
+    case 'over-under':
+      return Number.isInteger(d) ? (rec.side==='OVER' ? d>rec.barrier : d<rec.barrier) : null;
+    case 'even-odd':
+      return Number.isInteger(d) ? (rec.side==='EVEN' ? d%2===0 : d%2===1) : null;
+    case 'rise-fall':
+    case 'high-low-ticks':
+    case 'asian':
+      if(!prev || typeof prev.quote!=='number' || typeof tick?.quote!=='number') return null;
+      const up=tick.quote>prev.quote, down=tick.quote<prev.quote;
+      if(rec.side==='RISE'||rec.side==='HIGH TICKS'||rec.side==='ASIAN UP') return up;
+      if(rec.side==='FALL'||rec.side==='LOW TICKS'||rec.side==='ASIAN DOWN') return down;
+      return null;
+  }
+  return null;
+}
+function maybeRecalibrate(strategy){
+  const n=tracker.records.filter(r=>r.strategy===strategy).length;
+  if(n<300 || n%100!==0) return;
+  const rows=tracker.records.filter(r=>r.strategy===strategy && r.outcome);
+  const groups={};
+  for(const r of rows){
+    const k=r.label;
+    if(!groups[k]) groups[k]={signals:0,wins:0};
+    groups[k].signals++; if(r.outcome==='WIN') groups[k].wins++;
+  }
+  tracker.recalibrations[strategy]={at:n,groups};
+}
+function empiricalBonus(strategy,label){
+  const strategyCount=tracker.records.filter(r=>r.strategy===strategy && r.outcome).length;
+  if(strategyCount<300) return 0;
+  const recs=tracker.records.filter(r=>r.strategy===strategy && r.label===label && r.outcome);
+  if(recs.length<30) return 0;
+  const wins=recs.filter(r=>r.outcome==='WIN').length;
+  const hit=wins/recs.length;
+  // Small ranking bonus only; never a signal blocker. Centered at 50%.
+  return Math.max(-0.75,Math.min(0.75,(hit-0.5)*3));
+}
+function resolvePendingWithTick(tick,prev){
+  const keys=Object.keys(pendingSignals);
+  for(const key of keys){
+    const rec=pendingSignals[key];
+    if(!rec || rec.resolved || rec.market!==selectedSymbol) continue;
+    const ok=outcomeForSignal(rec,tick,prev);
+    if(ok===null) continue;
+    rec.resolved=true;
+    rec.outcome=ok?'WIN':'LOSS';
+    rec.resolvedAt=new Date().toISOString();
+    tracker.records.push({...rec});
+    maybeRecalibrate(rec.strategy);
+    delete pendingSignals[key];
+  }
+  saveTracker();
+  savePending();
+  updateTrackerUI();
+}
+function registerSignal(trace,data,result){
+  if(result==='WAIT') return;
+  const last=data[data.length-1];
+  const parts=result.split(' ');
+  const key=`${trace.strategy}|${selectedSymbol}`;
+  // One pending forward-test signal per strategy/market keeps outcomes independent.
+  if(pendingSignals[key] && !pendingSignals[key].resolved) return;
+
+  const signalEpoch=last?.epoch ?? null;
+  const duplicate=tracker.records.some(r =>
+    r.strategy===trace.strategy && r.market===selectedSymbol &&
+    r.signalEpoch===signalEpoch && r.label===result
+  );
+  if(signalEpoch!==null && duplicate) return;
+
+  const rec={
+    id:`${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+    timestamp:new Date().toISOString(), market:selectedSymbol, strategy:trace.strategy,
+    label:result, side:parts[0], targetDigit:null, barrier:null,
+    signalEpoch, signalQuote:last?.quote ?? null,
+    ticksUsed:data.length, engine:'v29-tracker'
+  };
+  if(trace.strategy==='matches-pattern') rec.targetDigit=Number(parts[1]);
+  if(trace.strategy==='matches-differs') rec.targetDigit=Number(parts[1]);
+  if(trace.strategy==='over-under') rec.barrier=Number(parts[1]);
+  pendingSignals[key]=rec;
+  savePending();
+  updateTrackerUI();
+}
+function trackerStats(){
+  const rows=tracker.records;
+  const wins=rows.filter(r=>r.outcome==='WIN').length;
+  const losses=rows.filter(r=>r.outcome==='LOSS').length;
+  const hit=rows.length ? wins/rows.length*100 : 0;
+  return {rows,wins,losses,hit};
+}
+function updateTrackerUI(){
+  const st=trackerStats();
+  const p=Object.keys(pendingSignals).length>0;
+  const statusEl=$('trackerStatus');
+  const summaryEl=$('trackerSummary');
+  const learningEl=$('trackerLearning');
+  if(!statusEl || !summaryEl) return;
+  statusEl.textContent=st.rows.length
+    ? `Completed signals: ${st.rows.length} | Wins: ${st.wins} | Losses: ${st.losses} | Overall hit rate: ${st.hit.toFixed(1)}%${p?' | A signal is waiting for its next qualifying tick.':''}`
+    : `No completed signals yet.${p?' A signal is waiting for its next qualifying tick.':''}`;
+  if(learningEl){
+    const byStrategy={};
+    for(const r of st.rows) byStrategy[r.strategy]=(byStrategy[r.strategy]||0)+1;
+    const learned=Object.entries(byStrategy).map(([k,n])=>`${k}: ${Math.min(n,300)}/300 before first recalibration`).join(' • ');
+    learningEl.textContent=learned || 'Learning starts after 300 completed signals per strategy; later recalibration occurs every 100. Learning only ranks candidates and never blocks signals.';
+  }
+  const groups={};
+  for(const r of st.rows){
+    const k=`${r.strategy}|${r.market}|${r.label}`;
+    if(!groups[k]) groups[k]={strategy:r.strategy,market:r.market,label:r.label,n:0,w:0};
+    groups[k].n++; if(r.outcome==='WIN')groups[k].w++;
+  }
+  const top=Object.values(groups).sort((a,b)=>b.n-a.n).slice(0,8);
+  summaryEl.innerHTML=top.length
+    ? `<strong>Performance by strategy / market / signal</strong><br>`+top.map(g=>`${g.strategy} · ${g.market} · <b>${g.label}</b>: ${g.w}/${g.n} wins (${(g.w/g.n*100).toFixed(1)}%)`).join('<br>')
+    : 'Performance details will appear after signals resolve.';
+}
+
+function downloadBlob(filename, content){
+  const blob=new Blob([content],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download=filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+function exportTrackerBackup(tag='manual'){
+  const payload={
+    format:'deriv-volatility-analyzer-tracker-backup',
+    version:29,
+    exportedAt:new Date().toISOString(),
+    tracker,
+    pendingSignals
+  };
+  const stamp=new Date().toISOString().replace(/[:.]/g,'-');
+  downloadBlob(`deriv_tracker_backup_${tag}_${stamp}.json`,JSON.stringify(payload,null,2));
+}
+function importTrackerBackup(file){
+  const reader=new FileReader();
+  reader.onload=()=>{
+    try{
+      const payload=JSON.parse(reader.result);
+      if(payload?.format!=='deriv-volatility-analyzer-tracker-backup' || !payload.tracker || !Array.isArray(payload.tracker.records)) throw new Error('Invalid backup format');
+      if(!confirm(`Restore backup from ${payload.exportedAt||'unknown date'}? This replaces the current tracker records on this device.`)) return;
+      tracker=payload.tracker;
+      pendingSignals=payload.pendingSignals && typeof payload.pendingSignals==='object' ? payload.pendingSignals : {};
+      saveTracker(); savePending(); updateTrackerUI();
+      setDiag('Tracker backup restored successfully. Analyzer strategy logic was not changed.');
+    }catch(e){ alert('Could not restore this backup: '+(e?.message||e)); }
+  };
+  reader.readAsText(file);
+}
+const exportTrackerBtn=$('exportTrackerBtn');
+if(exportTrackerBtn){
+  exportTrackerBtn.addEventListener('click',()=>exportTrackerBackup('manual'));
+}
+const restoreTrackerBtn=$('restoreTrackerBtn');
+const restoreTrackerFile=$('restoreTrackerFile');
+if(restoreTrackerBtn && restoreTrackerFile){
+  restoreTrackerBtn.addEventListener('click',()=>restoreTrackerFile.click());
+  restoreTrackerFile.addEventListener('change',()=>{
+    const f=restoreTrackerFile.files?.[0]; if(f) importTrackerBackup(f);
+    restoreTrackerFile.value='';
+  });
+}
+const resetTrackerBtn=$('resetTrackerBtn');
+if(resetTrackerBtn){
+  resetTrackerBtn.addEventListener('click',()=>{
+    if(!confirm('Before resetting, the current tracker data will be backed up as a JSON file. Continue?')) return;
+    exportTrackerBackup('pre-reset');
+    const typed=prompt('FINAL SAFETY CHECK: type RESET to delete the tracker data.');
+    if(typed!=='RESET'){ alert('Reset cancelled. Your tracker data was kept.'); return; }
+    if(!confirm('Are you absolutely sure you want to delete the tracker data?')) return;
+    tracker={records:[],recalibrations:{}};
+    pendingSignals={};
+    saveTracker(); savePending(); updateTrackerUI();
+    setDiag('Tracker data was reset after a backup was created. Analyzer strategy logic was not changed.');
+  });
+}
+updateTrackerUI();
+
+function runAnalysis(){
+  const data=sampleData(), strategy=$('strategy').value;
+  if(!connected){showFinal('WAIT','Not connected to Deriv.');return;}
+  if(data.length<30){showFinal('WAIT',`Not enough live tick data. Received ${data.length} ticks.`);return;}
+
+  const ranked=rankedDigits(data),top=ranked[0],second=ranked[1],gap=top.pct-second.pct;
+  const quality=digitQuality(data);
+  const market=availableMarkets.find(m=>m.symbol===selectedSymbol);
+  const precisionText=quality.decimals===null?'auto/fallback':`${quality.decimals} decimal place(s)`;
+  const trace={
+    timestamp:new Date().toISOString(), market:market?.name||selectedSymbol||'', strategy,
+    ticks:data.length, precision:precisionText, digits:quality.present.join(','),
+    result:'WAIT', engine:'v29-tracker-learning'
+  };
+  let result='WAIT';
+
+  if(strategy==='matches-pattern'){
+    const candidates=patternCandidates(data);
+    // Matches-only: choose the strongest recurring pattern/follow-through pair.
+    // A small edge floor avoids the old WAIT-machine while pattern recurrence
+    // keeps one-off coincidences out of the candidate pool.
+    const eligible=candidates.filter(c=>c.total>=6 && c.edge>=0.5 && c.lead>=1);
+    eligible.forEach(c=>{c.label=`MATCHES ${c.best.digit}`; c.learningBonus=empiricalBonus('matches-pattern',c.label); c.rankScore=c.score+c.learningBonus;});
+    eligible.sort((a,b)=>b.rankScore-a.rankScore || b.score-a.score || b.edge-a.edge || b.total-a.total);
+    const best=eligible[0] || null;
+    if(best){
+      result=`MATCHES ${best.best.digit}`;
+      trace.pattern={pattern:best.key,length:best.len,occurrences:best.total,digit:best.best.digit,pct:best.best.pct,edge:best.edge,score:best.score,lead:best.lead};
+    }
+  } else if(strategy==='matches-differs'){
+    const candidates=[];
+    for(const r of ranked){
+      const m=scoreBinary(r.count,data.length,0.10);
+      candidates.push({side:'MATCHES',digit:r.digit,label:`MATCHES ${r.digit}`,total:data.length,count:r.count,edge:m.edge,score:m.z,p:m.p*100});
+      candidates.push({side:'DIFFERS',digit:r.digit,label:`DIFFERS ${r.digit}`,total:data.length,count:data.length-r.count,edge:-m.edge,score:-m.z,p:(1-m.p)*100});
+    }
+    const best=practicalCandidate(candidates,0.5,'matches-differs');
+    if(best){
+      result=`${best.side} ${best.digit}`;
+      trace.matchesDiffers=best;
+    }
+  } else if(strategy==='over-under'){
+    const counts=digitCounts(data);
+    // Exact barrier set requested by the user:
+    // OVER: 1,2,3,4 only. UNDER: 6,7,8,9 only. Barrier 5 excluded.
+    const candidates=[];
+    for(const b of [1,2,3,4]){
+      const count=counts.slice(b+1).reduce((a,v)=>a+v,0);
+      const baseline=(9-b)/10;
+      const s=scoreBinary(count,data.length,baseline);
+      candidates.push({side:'OVER',barrier:b,label:`OVER ${b}`,count,p:s.p*100,baseline:baseline*100,edge:s.edge,score:s.z});
+    }
+    for(const b of [6,7,8,9]){
+      const count=counts.slice(0,b).reduce((a,v)=>a+v,0);
+      const baseline=b/10;
+      const s=scoreBinary(count,data.length,baseline);
+      candidates.push({side:'UNDER',barrier:b,label:`UNDER ${b}`,count,p:s.p*100,baseline:baseline*100,edge:s.edge,score:s.z});
+    }
+    const best=practicalCandidate(candidates,0.5,'over-under');
+    if(best){
+      result=`${best.side} ${best.barrier}`;
+      trace.overUnder=best;
+    }
+  } else if(strategy==='even-odd'){
+    const even=data.reduce((n,x)=>n+(x.digit%2===0?1:0),0);
+    const odd=data.length-even;
+    const cands=[];
+    const e=scoreBinary(even,data.length,0.5);
+    const o=scoreBinary(odd,data.length,0.5);
+    cands.push({side:'EVEN',label:'EVEN',count:even,total:data.length,p:e.p*100,edge:e.edge,score:e.z});
+    cands.push({side:'ODD',label:'ODD',count:odd,total:data.length,p:o.p*100,edge:o.edge,score:o.z});
+    const best=practicalCandidate(cands,0.5,'even-odd');
+    if(best){result=best.side;trace.evenOdd=best;}
+  } else if(strategy==='rise-fall'){
+    let rise=0,fall=0;
+    for(let i=1;i<data.length;i++){
+      if(data[i].quote>data[i-1].quote)rise++;
+      else if(data[i].quote<data[i-1].quote)fall++;
+    }
+    const total=rise+fall;
+    const cands=[];
+    if(total){
+      const r=scoreBinary(rise,total,0.5);
+      const f=scoreBinary(fall,total,0.5);
+      cands.push({side:'RISE',label:'RISE',count:rise,total,p:r.p*100,edge:r.edge,score:r.z});
+      cands.push({side:'FALL',label:'FALL',count:fall,total,p:f.p*100,edge:f.edge,score:f.z});
+    }
+    const best=practicalCandidate(cands,0.5,'rise-fall');
+    if(best){result=best.side;trace.riseFall=best;}
+  } else if(strategy==='high-low-ticks'){
+    let high=0,low=0;
+    for(let i=1;i<data.length;i++){
+      if(data[i].quote>data[i-1].quote)high++;
+      else if(data[i].quote<data[i-1].quote)low++;
+    }
+    const total=high+low;
+    const cands=[];
+    if(total){
+      const h=scoreBinary(high,total,0.5);
+      const l=scoreBinary(low,total,0.5);
+      cands.push({side:'HIGH TICKS',label:'HIGH TICKS',count:high,total,p:h.p*100,edge:h.edge,score:h.z});
+      cands.push({side:'LOW TICKS',label:'LOW TICKS',count:low,total,p:l.p*100,edge:l.edge,score:l.z});
+    }
+    const best=practicalCandidate(cands,0.5,'high-low-ticks');
+    if(best){result=best.side;trace.highLow=best;}
+  } else if(strategy==='asian'){
+    let ups=0,downs=0;
+    for(let i=1;i<data.length;i++){
+      if(data[i].quote>data[i-1].quote)ups++;
+      else if(data[i].quote<data[i-1].quote)downs++;
+    }
+    const total=ups+downs;
+    const cands=[];
+    if(total){
+      const u=scoreBinary(ups,total,0.5);
+      const d=scoreBinary(downs,total,0.5);
+      cands.push({side:'ASIAN UP',label:'ASIAN UP',count:ups,total,p:u.p*100,edge:u.edge,score:u.z});
+      cands.push({side:'ASIAN DOWN',label:'ASIAN DOWN',count:downs,total,p:d.p*100,edge:d.edge,score:d.z});
+    }
+    const best=practicalCandidate(cands,0.5,'asian');
+    if(best){result=best.side;trace.asian=best;}
+  }
+
+  trace.result=result;
+  // Keep supporting calculations internal. The user-facing FINAL RESULT is
+  // intentionally just the actionable result, such as OVER 3, MATCHES 7, or WAIT.
+  console.info('[Deriv Analyzer]',trace);
+  showFinal(result,'');
+  registerSignal(trace,data,result);
+}
+$('analyzeBtn').addEventListener('click',runAnalysis);
+// Do not auto-connect on page load. The user explicitly starts the public market-data connection.
+setConnection('Disconnected');
+setMarketStatus('Press Connect to Deriv to open the current public market-data WebSocket.');
+setDiag(`Current public API endpoint: ${PUBLIC_WS_URL}`);
+</script>
+</body>
+</html>
